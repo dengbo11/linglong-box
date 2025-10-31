@@ -91,7 +91,7 @@ set(linyaps-box_ACTIVE_LOG_LEVEL
 )
 
 set(linyaps-box_ENABLE_CPM
-    ON
+    OFF
     CACHE BOOL "enable CPM")
 
 if(CMAKE_VERSION VERSION_LESS "3.14")
@@ -105,11 +105,6 @@ set(linyaps-box_CPM_LOCAL_PACKAGES_ONLY
     OFF
     CACHE BOOL "use local packages only")
 
-if(linyaps-box_CPM_LOCAL_PACKAGES_ONLY)
-  message(STATUS "CPM is disabled")
-  set(linyaps-box_ENABLE_CPM OFF)
-endif()
-
 # ==============================================================================
 
 set(linyaps-box_LIBRARY linyaps-box)
@@ -118,7 +113,7 @@ set(linyaps-box_LIBRARY_SOURCE
     src/linyaps_box/app.cpp
     src/linyaps_box/app.h
     src/linyaps_box/cgroup.h
-    src/linyaps_box/cgroup_manager.c
+    src/linyaps_box/cgroup_manager.cpp
     src/linyaps_box/cgroup_manager.h
     src/linyaps_box/command/exec.cpp
     src/linyaps_box/command/exec.h
@@ -195,8 +190,7 @@ if(NOT linyaps-box_MAKE_RELEASE)
     COMMAND git rev-parse --short=7 HEAD
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE GIT_COMMIT_HASH
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
 
   set(LINYAPS_BOX_VERSION "${LINYAPS_BOX_VERSION}-dev-${GIT_COMMIT_HASH}")
 endif()
@@ -229,6 +223,10 @@ if(linyaps-box_ENABLE_CPM)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
   include(CPM)
 
+  if (linyaps-box_CPM_LOCAL_PACKAGES_ONLY)
+    set(CPM_USE_LOCAL_PACKAGES ON)
+  endif()
+
   CPMFindPackage(
     NAME nlohmann_json
     VERSION 3.11.3
@@ -238,7 +236,7 @@ if(linyaps-box_ENABLE_CPM)
     OPTIONS "JSON_BuildTests OFF")
   CPMFindPackage(
     NAME CLI11
-    VERSION 2.4.1
+    VERSION 2.5.0
     GITHUB_REPOSITORY CLIUtils/CLI11
     GIT_TAG v2.5.0
     EXCLUDE_FROM_ALL ON
@@ -257,12 +255,12 @@ endif()
 list(APPEND linyaps-box_LIBRARY_LINK_LIBRARIES PUBLIC
      nlohmann_json::nlohmann_json)
 
-find_package(CLI11 2.4.1 QUIET)
+find_package(CLI11 2.5.0 QUIET)
 if(NOT CLI11_FOUND)
   add_subdirectory(external/CLI11)
   list(APPEND CMAKE_MODULE_PATH
        "${CMAKE_CURRENT_SOURCE_DIR}/cmake.external/CLI11")
-  find_package(CLI11 2.4.1 REQUIRED)
+  find_package(CLI11 2.5.0 REQUIRED)
   message(STATUS "use vendor CLI11 ${CLI11_VERSION}")
 endif()
 
@@ -438,7 +436,8 @@ function(setup_linyaps_box_smoke_tests)
       ./tests/ll-box-st/09-check-rlimit.json
       ./tests/ll-box-st/10-check-oom.json
       ./tests/ll-box-st/11-output-to-null.json
-      ./tests/ll-box-st/12-bind-host-dev.json)
+      ./tests/ll-box-st/12-bind-host-dev.json
+      ./tests/ll-box-st/13-pid-extension.json)
 
   foreach(test ${linyaps-box_SMOKE_TESTS})
     add_test(

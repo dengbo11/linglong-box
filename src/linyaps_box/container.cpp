@@ -48,6 +48,7 @@
 #endif
 
 constexpr auto propagations_flag = (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE);
+constexpr auto max_symlink_depth{ 32 };
 
 namespace linyaps_box {
 
@@ -112,7 +113,7 @@ std::ostream &operator<<(std::ostream &os, const sync_message message)
     } break;
     default: {
         assert(false);
-        os << "UNKNOWN " << (uint8_t)message;
+        os << "UNKNOWN " << static_cast<uint8_t>(message);
     } break;
     }
     return os;
@@ -152,7 +153,7 @@ constexpr std::array<MountFlag, 27> mount_flags{ MountFlag{ MS_RDONLY, "MS_RDONL
                                                  { MS_ACTIVE, "MS_ACTIVE" },
                                                  { MS_NOUSER, "MS_NOUSER" } };
 
-std::string dump_mount_flags(uint flags) noexcept
+[[maybe_unused]] auto dump_mount_flags(unsigned long flags) noexcept -> std::string
 {
     std::stringstream ss;
     ss << "[ ";
@@ -282,10 +283,17 @@ void initialize_container(const linyaps_box::config &config,
 
         std::ofstream ofs("/proc/self/oom_score_adj");
         if (!ofs) {
-            throw std::runtime_error("failed to open /proc/self/oom_score_adj");
+            throw std::system_error(errno,
+                                    std::generic_category(),
+                                    "failed to open /proc/self/oom_score_adj");
         }
 
         ofs << score;
+        if (!ofs) {
+            throw std::system_error(errno,
+                                    std::generic_category(),
+                                    "failed to write to /proc/self/oom_score_adj");
+        }
     }
 }
 
@@ -310,6 +318,7 @@ void syscall_mount(const char *_special_file,
         if (_dir == nullptr) {
             return "nullptr";
         }
+
         if (auto str = std::string_view{ _dir }; str.rfind(fd_prefix, 0) == 0) {
             return linyaps_box::utils::inspect_fd(std::stoi(str.data() + fd_prefix.size()));
         }
@@ -367,7 +376,9 @@ void do_remount(const remount_t &mount)
     }
 
     auto state = linyaps_box::utils::statfs(mount.destination_fd);
-    auto remount_flags = state.f_flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC);
+    const auto dest_flag = static_cast<unsigned long>(state.f_flags);
+
+    auto remount_flags = dest_flag & (MS_NOSUID | MS_NODEV | MS_NOEXEC);
     if ((remount_flags | mount.flags) != mount.flags) {
         try {
             syscall_mount(nullptr,
@@ -384,19 +395,10 @@ void do_remount(const remount_t &mount)
         }
     }
 
-    if ((state.f_flags & MS_RDONLY) != 0) {
-        remount_flags = state.f_flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY);
+    if ((dest_flag & MS_RDONLY) != 0) {
+        remount_flags = dest_flag & (MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY);
         syscall_mount(nullptr, destination.c_str(), nullptr, mount.flags | remount_flags, data_ptr);
     }
-}
-
-[[nodiscard]] linyaps_box::utils::file_descriptor create_destination_file(
-        const linyaps_box::utils::file_descriptor &root, const std::filesystem::path &destination)
-{
-    LINYAPS_BOX_DEBUG() << "Creating file " << destination.string() << " under "
-                        << linyaps_box::utils::inspect_path(root.get());
-    const auto &parent = linyaps_box::utils::mkdir(root, destination.parent_path());
-    return linyaps_box::utils::touch(parent, destination.filename());
 }
 
 [[nodiscard]] linyaps_box::utils::file_descriptor create_destination_directory(
@@ -408,11 +410,39 @@ void do_remount(const remount_t &mount)
 }
 
 [[nodiscard]] linyaps_box::utils::file_descriptor
+create_destination_file(const linyaps_box::utils::file_descriptor &root,
+                        const std::filesystem::path &destination,
+                        int max_depth)
+{
+    if (max_depth < 0) {
+        throw std::system_error(ELOOP, std::system_category(), "failed to create file");
+    }
+
+    LINYAPS_BOX_DEBUG() << "Creating file " << destination.string() << " under "
+                        << linyaps_box::utils::inspect_path(root.get());
+    const auto &parent = create_destination_directory(root, destination.parent_path());
+
+    try {
+        auto ret = linyaps_box::utils::touch(parent,
+                                             destination.filename(),
+                                             O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW);
+        return ret;
+    } catch (std::system_error &e) {
+        if (e.code() != std::errc::too_many_symbolic_link_levels) {
+            throw;
+        }
+
+        auto target = linyaps_box::utils::readlinkat(parent, destination.filename());
+        return create_destination_file(root, target, max_depth - 1);
+    }
+}
+
+[[nodiscard]] linyaps_box::utils::file_descriptor
 create_destination_symlink(const linyaps_box::utils::file_descriptor &root,
                            const std::filesystem::path &source,
                            std::filesystem::path destination)
 {
-    auto ret = std::filesystem::read_symlink(source);
+    auto ret = linyaps_box::utils::readlink(source);
     auto parent = linyaps_box::utils::mkdir(root, destination.parent_path());
 
     LINYAPS_BOX_DEBUG() << "Creating symlink " << destination.string() << " under "
@@ -438,13 +468,8 @@ create_destination_symlink(const linyaps_box::utils::file_descriptor &root,
                                         + " already exists and is not a symlink");
     }
 
-    std::array<char, PATH_MAX + 1> buf{};
-    auto to = ::readlinkat(root.get(), destination.c_str(), buf.data(), buf.size());
-    if (to == -1) {
-        throw std::system_error(errno, std::system_category(), "readlinkat");
-    }
-
-    if (std::string_view{ buf.data(), static_cast<size_t>(to) } == ret) {
+    auto target = linyaps_box::utils::readlinkat(root, destination);
+    if (target == ret) {
         return linyaps_box::utils::open_at(root, destination, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     }
 
@@ -460,11 +485,9 @@ ensure_mount_destination(bool isDir,
                          const linyaps_box::config::mount_t &mount)
 try {
     assert(mount.destination.has_value());
-    auto open_flag = O_PATH;
-    if ((mount.flags & LINGYAPS_MS_NOSYMFOLLOW) != 0) {
-        open_flag |= O_NOFOLLOW;
-    }
-
+    auto open_flag = O_PATH | O_CLOEXEC;
+    LINYAPS_BOX_DEBUG() << "Opening " << (isDir ? "directory " : "file ")
+                        << mount.destination.value() << " under " << root.current_path();
     return linyaps_box::utils::open_at(root, mount.destination.value(), open_flag);
 } catch (const std::system_error &e) {
     if (e.code().value() != ENOENT) {
@@ -483,7 +506,7 @@ try {
         return create_destination_directory(root, path);
     }
 
-    return create_destination_file(root, path);
+    return create_destination_file(root, path, max_symlink_depth);
 }
 
 void do_propagation_mount(const linyaps_box::utils::file_descriptor &destination,
@@ -523,7 +546,7 @@ void do_propagation_mount(const linyaps_box::utils::file_descriptor &destination
                       nullptr,
                       bind_flags,
                       nullptr);
-    } catch (const std::system_error &e) {
+    } catch ([[maybe_unused]] const std::system_error &e) {
         // mounting sysfs with rootless/userns container will fail with EPERM
         // TODO: try to bind mount /sys
         throw;
@@ -532,9 +555,9 @@ void do_propagation_mount(const linyaps_box::utils::file_descriptor &destination
     return linyaps_box::utils::open_at(root, mount.destination.value(), open_flag);
 }
 
-void do_cgroup_mount([[maybe_unused]] const linyaps_box::utils::file_descriptor &root,
-                     [[maybe_unused]] const linyaps_box::config::mount_t &mount,
-                     [[maybe_unused]] std::string_view unified_cgroup_path)
+[[noreturn]] void do_cgroup_mount([[maybe_unused]] const linyaps_box::utils::file_descriptor &root,
+                                  [[maybe_unused]] const linyaps_box::config::mount_t &mount,
+                                  [[maybe_unused]] std::string_view unified_cgroup_path)
 {
     // TODO: implement
     throw std::runtime_error("mount cgroup: Not implemented");
@@ -651,7 +674,7 @@ class mounter
             try {
                 do_propagation_mount(rootfsfd, MS_PRIVATE);
                 return;
-            } catch (const std::system_error &e) {
+            } catch ([[maybe_unused]] const std::system_error &e) {
                 auto parent_fd = ::openat(rootfsfd.get(), "..", O_PATH | O_CLOEXEC);
                 if (parent_fd < 0) {
                     throw std::system_error(errno,
@@ -668,10 +691,10 @@ class mounter
     }
 
 public:
-    explicit mounter(linyaps_box::utils::file_descriptor root,
+    explicit mounter(linyaps_box::utils::file_descriptor rootfd,
                      const linyaps_box::container &container)
         : container(container)
-        , root(std::move(root))
+        , root(std::move(rootfd))
     {
     }
 
@@ -768,6 +791,8 @@ public:
             return;
         }
 
+        LINYAPS_BOX_DEBUG() << "make readonly paths";
+
         for (const auto &path : *linux->readonly_paths) {
             linyaps_box::utils::file_descriptor dst;
             try {
@@ -814,10 +839,14 @@ public:
             return;
         }
 
+        LINYAPS_BOX_DEBUG() << "make masked paths";
+
         for (const auto &path : *linux->masked_paths) {
             linyaps_box::utils::file_descriptor dst;
             try {
-                dst = linyaps_box::utils::open_at(root, path);
+                // we only need to open a fd to refer to the path
+                // so O_PATH is sufficient.
+                dst = linyaps_box::utils::open_at(root, path, O_PATH | O_CLOEXEC);
             } catch (const std::system_error &e) {
                 if (auto err = e.code().value(); err == ENOENT || err == EACCES) {
                     continue;
@@ -1212,16 +1241,19 @@ void configure_mounts(const linyaps_box::container &container, const std::filesy
 
     LINYAPS_BOX_DEBUG() << "Execute container process:" << [&process]() -> std::string {
         std::stringstream ss;
+        assert(!process.args.empty());
+
         ss << " " << process.args[0];
-        for (size_t i = 1; i < process.args.size(); ++i) {
-            ss << " " << process.args[i];
-        }
+        std::for_each(process.args.cbegin() + 1, process.args.cend(), [&ss](const auto &arg) {
+            ss << " " << arg;
+        });
+
         return ss.str();
     }();
 
     execvpe(c_args[0],
-            const_cast<char *const *>(c_args.data()),
-            const_cast<char *const *>(c_env.data()));
+            const_cast<char *const *>(c_args.data()), // NOLINT
+            const_cast<char *const *>(c_env.data())); // NOLINT
 
     throw std::system_error(errno, std::generic_category(), "execvpe");
 }
@@ -1489,7 +1521,7 @@ void set_capabilities(const linyaps_box::container &container, int last_cap)
         throw std::system_error(errno, std::generic_category(), "cap_ambient_clear_all");
     }
 
-    std::for_each(capabilities.ambient.cend(), capabilities.ambient.cend(), [](cap_value_t cap) {
+    std::for_each(capabilities.ambient.cbegin(), capabilities.ambient.cend(), [](cap_value_t cap) {
         auto ret = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0L, 0L);
         if (ret < 0) {
             throw std::system_error(errno, std::generic_category(), "cap_ambient_raise");
@@ -1562,8 +1594,13 @@ void processing_extensions(const linyaps_box::container &container)
     LINYAPS_BOX_DEBUG() << "Processing container extensions";
 
     // ext_ns_last_pid
-    if (auto it = config.annotations->find("cn.org.linyaps.runtime.ns_last_pid");
-        it != config.annotations->end()) {
+    // This file may not exist if the kernel config CONFIG_CHECKPOINT_RESTORE is not enabled
+    // and this feature originally was used for userspace checkpoint/restore
+    // we use this feature for avoiding two process has the same pid.
+    // e.g some application will register a tray through dbus and use the pid as the part of
+    // dbus object path, if two process has the same pid, the dbus object path will conflict
+    auto it = config.annotations->find("cn.org.linyaps.runtime.ns_last_pid");
+    while (it != config.annotations->end()) {
         LINYAPS_BOX_DEBUG() << "Processing ns_last_pid extension: " << it->second;
 
         // Validate input is a valid pid_t number
@@ -1576,23 +1613,33 @@ void processing_extensions(const linyaps_box::container &container)
                                          + std::to_string(std::numeric_limits<pid_t>::max()) + ")");
             }
         } catch (const std::out_of_range &e) {
-            throw std::runtime_error("ns_last_pid value out of range: " + it->second);
+            throw std::runtime_error("parse ns_last_pid " + it->second + " failed: " + e.what());
         } catch (const std::invalid_argument &e) {
-            throw std::runtime_error("Invalid ns_last_pid value: " + it->second
-                                     + " (must be a valid number)");
+            throw std::runtime_error("parse ns_last_pid " + it->second + " failed: " + e.what());
         }
 
-        std::ofstream ofs("/proc/sys/kernel/ns_last_pid");
+        // ignore ns_last_pid if the file does not exist
+        auto ns_last_pid = std::filesystem::path{ "/proc/sys/kernel/ns_last_pid" };
+        if (!std::filesystem::exists(ns_last_pid)) {
+            break;
+        }
+
+        std::ofstream ofs(ns_last_pid);
         if (!ofs) {
-            throw std::runtime_error("failed to open /proc/sys/kernel/ns_last_pid");
+            throw std::system_error(errno,
+                                    std::generic_category(),
+                                    "failed to open /proc/sys/kernel/ns_last_pid");
         }
 
         ofs << it->second;
         if (!ofs) {
-            throw std::runtime_error("failed to write to /proc/sys/kernel/ns_last_pid");
+            throw std::system_error(errno,
+                                    std::generic_category(),
+                                    "failed to write to /proc/sys/kernel/ns_last_pid");
         }
 
         LINYAPS_BOX_DEBUG() << "Successfully set ns_last_pid to " << it->second;
+        break;
     }
 
     LINYAPS_BOX_DEBUG() << "Container extensions processing completed";
@@ -1628,8 +1675,16 @@ try {
     auto &args = *static_cast<clone_fn_args *>(data);
 
     assert(args.socket.get() >= 0);
-    close_other_fds(
-            { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, (unsigned int)(args.socket.get()) });
+    std::set<uint> except_fds{
+        STDIN_FILENO,
+        STDOUT_FILENO,
+        STDERR_FILENO,
+    };
+    for (uint fd = 0; fd < args.container->preserve_fds(); ++fd) {
+        except_fds.insert(fd + 3);
+    }
+    except_fds.insert(static_cast<unsigned int>(args.socket.get()));
+    close_other_fds(std::move(except_fds));
 
     const auto &container = *args.container;
     const auto &process = *args.process;
@@ -1637,6 +1692,7 @@ try {
 
     auto rootfs = container.get_config().root.path;
     if (rootfs.is_relative()) {
+        LINYAPS_BOX_DEBUG() << "rootfs is relative based on bundle path:" << container.get_bundle();
         rootfs = std::filesystem::canonical(container.get_bundle() / rootfs);
     }
 
@@ -1709,8 +1765,11 @@ namespace runtime_ns {
             flag |= CLONE_NEWCGROUP;
             LINYAPS_BOX_DEBUG() << "Add CLONE_NEWCGROUP, flag=0x" << std::hex << flag;
         } break;
+        case linyaps_box::config::linux_t::namespace_t::INVALID: {
+            throw std::invalid_argument("invalid namespace type: " + std::to_string(ns.type));
+        } break;
         default: {
-            throw std::invalid_argument("invalid namespace");
+            throw std::invalid_argument("unknown namespace type: " + std::to_string(ns.type));
         }
         }
 
@@ -1756,12 +1815,12 @@ public:
         assert(false);
     }
 
-    [[nodiscard]] void *top() const noexcept
+    [[nodiscard]] auto top() const noexcept -> void *
     {
         if constexpr (LINYAPS_BOX_STACK_GROWTH_DOWN) {
-            return (char *)this->stack_low + LINYAPS_BOX_CLONE_CHILD_STACK_SIZE;
+            return static_cast<std::byte *>(this->stack_low) + LINYAPS_BOX_CLONE_CHILD_STACK_SIZE;
         } else {
-            return (char *)this->stack_low - LINYAPS_BOX_CLONE_CHILD_STACK_SIZE;
+            return static_cast<std::byte *>(this->stack_low) - LINYAPS_BOX_CLONE_CHILD_STACK_SIZE;
         }
     }
 
@@ -1804,14 +1863,14 @@ std::tuple<int, linyaps_box::utils::file_descriptor> start_container_process(
         namespaces = config.linux->namespaces;
     }
 
-    int clone_flag = runtime_ns::generate_clone_flag(namespaces);
+    const int clone_flag = runtime_ns::generate_clone_flag(namespaces);
     clone_fn_args args = { &container, &process, std::move(sockets.second) };
 
     LINYAPS_BOX_DEBUG() << "OCI runtime in runtime namespace: PID=" << getpid()
                         << " PIDNS=" << linyaps_box::utils::get_pid_namespace();
 
-    child_stack stack;
-    int child_pid = clone(container_ns::clone_fn, stack.top(), clone_flag, (void *)&args);
+    const child_stack stack;
+    const int child_pid = clone(container_ns::clone_fn, stack.top(), clone_flag, (void *)&args);
     if (child_pid < 0) {
         throw std::runtime_error("clone failed");
     }
@@ -2274,14 +2333,13 @@ void poststop_hooks(const linyaps_box::container &container) noexcept
 } // namespace
 
 linyaps_box::container::container(const status_directory &status_dir,
-                                  const std::string &id,
-                                  const std::filesystem::path &bundle,
-                                  std::filesystem::path config,
-                                  cgroup_manager_t manager)
-    : container_ref(status_dir, id)
-    , bundle(bundle)
+                                  const create_container_options_t &options)
+    : container_ref(status_dir, options.ID)
+    , preserve_fds_(options.preserve_fds)
     , data(new linyaps_box::container_data)
+    , bundle(options.bundle)
 {
+    auto config = options.config;
     if (config.is_relative()) {
         config = bundle / config;
     }
@@ -2307,7 +2365,7 @@ linyaps_box::container::container(const status_directory &status_dir,
     {
         container_status_t status;
         status.oci_version = linyaps_box::config::oci_version;
-        status.ID = id;
+        status.ID = options.ID;
         status.PID = getpid();
         status.status = container_status_t::runtime_status::CREATING;
         status.bundle = bundle;
@@ -2320,7 +2378,7 @@ linyaps_box::container::container(const status_directory &status_dir,
         this->status_dir().write(status);
     }
 
-    switch (manager) {
+    switch (options.manager) {
     case cgroup_manager_t::disabled: {
         this->manager = std::make_unique<disabled_cgroup_manager>();
     } break;
