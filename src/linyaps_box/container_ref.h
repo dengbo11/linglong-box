@@ -29,7 +29,7 @@ struct exec_container_option
     std::vector<std::string> extra_envs;
     std::vector<std::string> command;
 #ifdef LINYAPS_BOX_ENABLE_CAP
-    std::optional<std::vector<cap_value_t>> caps;
+    std::optional<std::vector<std::string>> caps;
 #endif
 
     std::optional<infra::unix_socket> console_socket;
@@ -46,7 +46,7 @@ public:
     container_ref(container_ref &&) = default;
     auto operator=(container_ref &&) -> container_ref & = default;
 
-    [[nodiscard]] auto status() const -> container_status_t;
+    [[nodiscard]] auto status() const -> container_status;
     void kill(int signal) const;
     [[nodiscard]] auto exec(exec_container_option option) const -> int;
 

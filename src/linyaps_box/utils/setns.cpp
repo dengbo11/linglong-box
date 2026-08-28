@@ -5,7 +5,7 @@
 #include "linyaps_box/utils/setns.h"
 
 #include "linyaps_box/log/macro.h"
-#include "linyaps_box/utils/file.h"
+#include "linyaps_box/os/fs.h"
 #include "linyaps_box/utils/utils.h"
 
 #include <system_error>
@@ -38,6 +38,8 @@ auto to_proc_ns_string(linyaps_box::oci_config::linux_t::namespace_t::type type)
         return "cgroup";
     case linyaps_box::oci_config::linux_t::namespace_t::type::TIME:
         return "time";
+    case linyaps_box::oci_config::linux_t::namespace_t::type::NONE:
+        return "none";
     }
 
     __builtin_unreachable();
@@ -52,7 +54,8 @@ auto open_namespace_fd(pid_t target_pid, oci_config::linux_t::namespace_t::type 
 {
     auto path = std::filesystem::path{ "/proc" } / std::to_string(target_pid) / "ns"
       / to_proc_ns_string(ns_type);
-    return utils::open(path, O_RDONLY | O_CLOEXEC);
+    return os::throw_if_error(
+      os::open(path, { os::sys::open_flag::cloexec, os::sys::access_mode::read_only }));
 }
 
 void setns(const file_descriptor &ns_fd, oci_config::linux_t::namespace_t::type ns_type)

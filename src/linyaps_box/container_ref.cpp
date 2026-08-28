@@ -5,10 +5,14 @@
 #include "linyaps_box/container_ref.h"
 
 #include "linyaps_box/container_monitor.h"
+#include "linyaps_box/infra/process_handle.h"
 #include "linyaps_box/log/logger.h"
 #include "linyaps_box/log/macro.h"
+#include "linyaps_box/os/fs.h" // IWYU pragma: keep
 #include "linyaps_box/os/process.h"
 #include "linyaps_box/protocol/message_channel.h"
+#include "linyaps_box/protocol/sync_socket_forwarder.h"
+#include "linyaps_box/security/privilege.h"
 #include "linyaps_box/terminal.h"
 #include "linyaps_box/utils/close_range.h"
 #include "linyaps_box/utils/defer.h"
@@ -17,18 +21,7 @@
 #include "linyaps_box/utils/setns.h"
 #include "linyaps_box/utils/utils.h"
 
-#include <algorithm>
-#include <cassert>
-#include <csignal> // IWYU pragma: keep
-#include <fstream>
-#include <limits>
-#include <utility>
-#include <vector>
-
-#include <grp.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace linyaps_box {
 
@@ -105,7 +98,7 @@ void child_setup_terminal(const linyaps_box::oci_config::process_t &proc,
         return;
     }
 
-    auto [master, slave] = linyaps_box::create_pty_pair();
+    auto [slave, path, master] = linyaps_box::create_pty_pair();
 
     slave.setup_stdio();
     if (proc.console_size) {
@@ -113,43 +106,8 @@ void child_setup_terminal(const linyaps_box::oci_config::process_t &proc,
     }
 
     auto console_fd = std::move(master).take();
-    std::vector<linyaps_box::utils::file_descriptor> fds;
-    fds.emplace_back(std::move(console_fd));
-    sync.send(protocol::msg::console_fd{ }, fds);
-}
-
-void child_apply_credentials(const linyaps_box::oci_config::process_t &proc)
-{
-    if (proc.user.umask) {
-        ::umask(*proc.user.umask);
-    }
-
-    if (proc.user.uid == 0 && proc.user.gid == 0 && !proc.user.additional_gids) {
-        return;
-    }
-
-    if (::setresgid(proc.user.gid, proc.user.gid, proc.user.gid) != 0) {
-        _exit(EXIT_FAILURE);
-    }
-
-    if (proc.user.additional_gids) {
-        if (::setgroups(proc.user.additional_gids->size(), proc.user.additional_gids->data())
-            != 0) {
-            _exit(EXIT_FAILURE);
-        }
-    }
-
-    if (::setresuid(proc.user.uid, proc.user.uid, proc.user.uid) != 0) {
-        _exit(EXIT_FAILURE);
-    }
-
-    for (auto fd : { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO }) {
-        if (::fchown(fd, proc.user.uid, proc.user.gid) != 0) {
-            if (errno != EINVAL && errno != ENOSYS) {
-                _exit(EXIT_FAILURE);
-            }
-        }
-    }
+    auto ref = console_fd.ref();
+    sync.send_console_fd(ref);
 }
 
 void child_apply_environment(const linyaps_box::oci_config::process_t &proc,
@@ -193,125 +151,16 @@ void child_apply_rlimits(const linyaps_box::oci_config::process_t &proc)
     }
 }
 
-#ifdef LINYAPS_BOX_ENABLE_CAP
-void child_apply_capabilities(const linyaps_box::oci_config::process_t &proc,
-                              const linyaps_box::oci_config &config)
-{
-    LINYAPS_BOX_LOG_DEBUG("apply capabilities");
-    // Determine which caps to apply: prefer the exec-specific set, fall back to
-    // the container's config.json default if the exec set is entirely empty.
-    auto effective_caps =
-      [&]() -> std::optional<linyaps_box::oci_config::process_t::capabilities_t> {
-        if (!proc.capabilities) {
-            return config.process->capabilities;
-        }
-
-        auto all_empty = [](const linyaps_box::oci_config::process_t::capabilities_t &c) {
-            return (!c.effective || c.effective->empty()) && (!c.bounding || c.bounding->empty())
-              && (!c.inheritable || c.inheritable->empty())
-              && (!c.permitted || c.permitted->empty()) && (!c.ambient || c.ambient->empty());
-        };
-
-        if (all_empty(*proc.capabilities)) {
-            return config.process->capabilities;
-        }
-
-        return proc.capabilities;
-    }();
-
-    if (!effective_caps) {
-        return;
-    }
-
-    auto should_apply = [](const linyaps_box::oci_config::process_t::capabilities_t &c) {
-        return (c.effective && !c.effective->empty()) || (c.bounding && !c.bounding->empty())
-          || (c.inheritable && !c.inheritable->empty()) || (c.permitted && !c.permitted->empty())
-          || (c.ambient && !c.ambient->empty());
-    };
-
-    if (!should_apply(*effective_caps)) {
-        return;
-    }
-
-    LINYAPS_BOX_LOG_DEBUG("Set capabilities for exec");
-
-    // Drop every cap not in the bounding set.
-    if (effective_caps->bounding) {
-        const auto &bounding_set = *effective_caps->bounding;
-        std::ifstream cap_file("/proc/sys/kernel/cap_last_cap");
-        unsigned long last_cap{ 0 };
-        cap_file >> last_cap;
-        for (unsigned long cap = 0; cap < last_cap; ++cap) {
-            if (std::find(bounding_set.cbegin(), bounding_set.cend(), static_cast<int>(cap))
-                == bounding_set.cend()) {
-                if (cap_drop_bound(static_cast<int>(cap)) < 0) {
-                    throw std::system_error(errno, std::system_category(), "cap_drop_bound");
-                }
-            }
-        }
-    }
-
-    auto *cap = cap_init();
-    if (cap == nullptr) {
-        throw std::system_error(errno, std::system_category(), "cap_init");
-    }
-    const std::unique_ptr<_cap_struct, decltype(&cap_free)> caps(cap, cap_free);
-
-    auto set_cap_flag = [&caps](const std::vector<cap_value_t> &cap_set, cap_flag_t flag) {
-        if (cap_set.empty()) {
-            return;
-        }
-        auto ret = cap_set_flag(caps.get(), flag, cap_set.size(), cap_set.data(), CAP_SET);
-        if (ret < 0) {
-            throw std::system_error(errno, std::system_category(), "cap_set_flag");
-        }
-    };
-
-    if (effective_caps->effective) {
-        set_cap_flag(*effective_caps->effective, CAP_EFFECTIVE);
-    }
-
-    if (effective_caps->permitted) {
-        set_cap_flag(*effective_caps->permitted, CAP_PERMITTED);
-    }
-
-    if (effective_caps->inheritable) {
-        set_cap_flag(*effective_caps->inheritable, CAP_INHERITABLE);
-    }
-
-    if (cap_set_proc(caps.get()) < 0) {
-        throw std::system_error(errno, std::system_category(), "cap_set_proc");
-    }
-
-    os::throw_if_error(os::prctl(PR_SET_KEEPCAPS, 1L, 0L, 0L, 0L));
-
-    if (cap_set_proc(caps.get()) < 0) {
-        throw std::system_error(errno, std::system_category(), "cap_set_proc");
-    }
-
-#  ifdef PR_CAP_AMBIENT
-    os::throw_if_error(os::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0L, 0L, 0L));
-    if (const auto &ambient_set = effective_caps->ambient; ambient_set) {
-        std::for_each(ambient_set->cbegin(), ambient_set->cend(), [](cap_value_t cap) {
-            os::throw_if_error(os::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0L, 0L));
-        });
-    }
-#  endif
-}
-#endif // LINYAPS_BOX_ENABLE_CAP
-
-[[noreturn]] void exec_child_process(pid_t target_pid,
+[[noreturn]] auto exec_child_process(pid_t target_pid,
                                      const linyaps_box::oci_config &config,
                                      const linyaps_box::oci_config::process_t &proc,
                                      int preserve_fds,
-                                     linyaps_box::infra::unix_socket sync_sock)
+                                     protocol::child_message_channel child_chan) -> void
 {
-    auto sync = protocol::child_message_channel(std::move(sync_sock));
-
     try {
         auto &logger = linyaps_box::log::global_logger::instance();
-        logger.unset_sink();
-        logger.set_sink(linyaps_box::log::sync_socket_sink(sync));
+        logger.set_forwarder(
+          std::make_unique<linyaps_box::protocol::sync_socket_forwarder>(child_chan));
 
         bool pid_ns{ false };
         if (config.linux && config.linux->namespaces) {
@@ -331,19 +180,19 @@ void child_apply_capabilities(const linyaps_box::oci_config::process_t &proc,
             }
 
             if (grandchild > 0) {
-                sync.send(protocol::msg::pid_report{ static_cast<pid_t>(grandchild) });
+                child_chan.send_pid_report(static_cast<pid_t>(grandchild));
                 _exit(EXIT_SUCCESS);
             }
         } else {
-            sync.send(protocol::msg::pid_report{ ::getpid() });
+            child_chan.send_pid_report(::getpid());
         }
 
-        sync.wait_for_proceed();
+        child_chan.expect_proceed();
 
         linyaps_box::utils::setsid();
 
-        if (proc.terminal) {
-            child_setup_terminal(proc, sync);
+        if (proc.terminal.value_or(false)) {
+            child_setup_terminal(proc, child_chan);
         }
 
         child_apply_environment(proc, config);
@@ -354,16 +203,45 @@ void child_apply_capabilities(const linyaps_box::oci_config::process_t &proc,
                                         std::numeric_limits<unsigned>::max(),
                                         CLOSE_RANGE_CLOEXEC);
 
-        child_apply_credentials(proc);
-
-        if (proc.no_new_privileges) {
-            LINYAPS_BOX_LOG_DEBUG("Set no new privileges");
-            os::throw_if_error(os::prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L));
+        if (proc.user.umask) {
+            auto val = proc.user.umask.value();
+            os::throw_if_error(os::umask(val), fmt::format("failed to set umask {}", val));
         }
 
-#ifdef LINYAPS_BOX_ENABLE_CAP
-        child_apply_capabilities(proc, config);
-#endif
+        security::privilege_context ctx{ proc.user };
+
+        auto effective_caps = [&]() -> std::optional<oci_config::process_t::capabilities_t> {
+            if (!proc.capabilities) {
+                return config.process->capabilities;
+            }
+
+            const auto &caps = *proc.capabilities;
+            auto all_empty = (!caps.effective || caps.effective->empty())
+              && (!caps.bounding || caps.bounding->empty())
+              && (!caps.inheritable || caps.inheritable->empty())
+              && (!caps.permitted || caps.permitted->empty())
+              && (!caps.ambient || caps.ambient->empty());
+
+            if (all_empty) {
+                return config.process->capabilities;
+            }
+
+            return proc.capabilities;
+        }();
+
+        ctx.set_capabilities(std::move(effective_caps))
+          .set_no_new_privs(proc.no_new_privileges.value_or(false));
+
+        // change before we drop caps
+        for (auto fd : { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO }) {
+            if (::fchown(fd, proc.user.uid, proc.user.gid) != 0) {
+                if (errno != EINVAL && errno != ENOSYS) {
+                    throw std::system_error(errno, std::system_category(), "fchown");
+                }
+            }
+        }
+
+        ctx.apply();
 
         std::vector<const char *> c_args;
         c_args.reserve(proc.args.size() + 1);
@@ -388,7 +266,7 @@ void child_apply_capabilities(const linyaps_box::oci_config::process_t &proc,
 
         LINYAPS_BOX_LOG_DEBUG("exec command");
 
-        sync.send_stage(protocol::stage::type::exec_ready);
+        child_chan.send_stage(protocol::stage::type::exec_ready);
 
         ::execvpe(c_args.at(0),
                   const_cast<char *const *>(c_args.data()),
@@ -435,7 +313,7 @@ auto exec_parent_process(protocol::parent_message_channel sync,
     // Unblock the grandchild so it can proceed with terminal setup and exec.
     // In the future, cgroup/scheduler setup with the real pid goes here,
     // between pid_report and proceed.
-    sync.send(protocol::msg::proceed{ });
+    sync.send_proceed();
 
     auto in = linyaps_box::utils::file_descriptor{ STDIN_FILENO, false };
     auto out = linyaps_box::utils::file_descriptor{ STDOUT_FILENO, false };
@@ -468,7 +346,8 @@ auto exec_parent_process(protocol::parent_message_channel sync,
                              auto master_fd = std::move(fds.front());
 
                              if (external_console_socket) {
-                                 external_console_socket->send_fd(master_fd);
+                                 os::throw_if_error(
+                                   external_console_socket->send_fd(master_fd.ref()));
                              } else {
                                  in.set_nonblock(true);
                                  out.set_nonblock(true);
@@ -487,7 +366,7 @@ auto exec_parent_process(protocol::parent_message_channel sync,
                        console_inc.body);
         }
 
-        sync.wait_for(protocol::stage::type::exec_ready);
+        sync.wait_for_stage(protocol::stage::type::exec_ready);
         sync.wait_for_close();
 
         return monitor.wait_container_exit();
@@ -507,35 +386,83 @@ container_ref::container_ref(status_directory status_dir, std::string id)
 
 container_ref::~container_ref() noexcept = default;
 
-container_status_t linyaps_box::container_ref::status() const
+container_status linyaps_box::container_ref::status() const
 {
     return status_dir_.read();
 }
 
-void container_ref::kill(int signal) const
-{
-    auto pid = this->status().PID;
+namespace {
 
-    LINYAPS_BOX_LOG_DEBUG("kill process {} with signal {}", pid, signal);
-    if (::kill(pid, signal) == 0) {
-        return;
+// the handle pins the process, but confirming that the pinned process
+// is still the original container init is an operation-semantics check
+// (pessimistic — refuse on uncertainty).
+auto verify_container_process(const infra::process_handle &handle,
+                              const container_status &st,
+                              std::string_view action) -> void
+{
+    auto stat = handle.status();
+    if (UNLIKELY(!stat)) {
+        throw std::system_error(stat.error(),
+                                fmt::format("cannot read status of container process {} "
+                                            "before {}",
+                                            st.pid,
+                                            action));
     }
 
-    std::stringstream ss;
-    ss << "failed to kill process " << pid << " with signal " << signal;
-    throw std::system_error(errno, std::system_category(), std::move(ss).str());
+    if (UNLIKELY(stat->state == infra::process_state::zombie
+                 || stat->state == infra::process_state::dead)) {
+        throw std::system_error(std::make_error_code(std::errc::no_such_process),
+                                fmt::format("container process {} is not running", st.pid));
+    }
+
+    if (UNLIKELY(stat->start_time != st.process_start_time)) {
+        throw std::system_error(std::make_error_code(std::errc::no_such_process),
+                                fmt::format("container PID {} was reused by another process; "
+                                            "refusing to {}",
+                                            st.pid,
+                                            action));
+    }
+}
+
+} // anonymous namespace
+
+void container_ref::kill(int signal) const
+{
+    auto st = this->status();
+
+    auto handle = infra::process_handle::open(st.pid);
+    if (UNLIKELY(!handle)) {
+        throw std::system_error(handle.error(),
+                                fmt::format("failed to open container process {}", st.pid));
+    }
+
+    verify_container_process(*handle, st, "send signal");
+
+    os::throw_if_error(handle->send_signal(signal),
+                       fmt::format("failed to kill container process {}", st.pid));
 }
 
 auto container_ref::exec(exec_container_option option) const -> int
 {
-    auto target_pid = this->status().PID;
+    auto st = this->status();
 
-    os::throw_if_error(os::prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L));
+    // Defense against PID reuse
+    auto handle = infra::process_handle::open(st.pid);
+    if (UNLIKELY(!handle)) {
+        throw std::system_error(handle.error(),
+                                fmt::format("failed to open container process {}", st.pid));
+    }
+
+    verify_container_process(*handle, st, "exec process");
+
+    auto target_pid = handle->pid();
+
+    os::throw_if_error(os::set_child_subreaper(true));
 
     auto config = oci_config::parse(status_dir_.config());
     auto &proc = resolve_final_process(option, config);
 
-    auto [raw_parent, raw_child] = infra::unix_socket::create_socketpair();
+    auto [parent_chan, child_chan] = protocol::create_message_socketpair();
 
     auto child = ::fork();
     if (UNLIKELY(child < 0)) {
@@ -543,16 +470,15 @@ auto container_ref::exec(exec_container_option option) const -> int
     }
 
     if (child == 0) {
-        raw_parent.close();
+        parent_chan.close();
         option.console_socket.reset();
 
-        exec_child_process(target_pid, config, proc, option.preserve_fds, std::move(raw_child));
+        exec_child_process(target_pid, config, proc, option.preserve_fds, std::move(child_chan));
     }
 
-    raw_child.close();
-    auto sync = protocol::parent_message_channel(std::move(raw_parent));
-    return exec_parent_process(std::move(sync),
-                               static_cast<bool>(proc.terminal),
+    child_chan.close();
+    return exec_parent_process(std::move(parent_chan),
+                               proc.terminal.value_or(false),
                                std::move(option.console_socket));
 }
 

@@ -8,9 +8,10 @@
 
 #include <filesystem>
 
-#include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+// TODO: move this class to os
 
 namespace linyaps_box::utils {
 
@@ -48,6 +49,48 @@ struct IOResult
     std::size_t bytes;
 };
 
+class file_descriptor;
+
+class file_descriptor_ref
+{
+public:
+    constexpr file_descriptor_ref() noexcept = default;
+
+    file_descriptor_ref(const file_descriptor &fd) noexcept;
+
+    [[nodiscard]] constexpr int get() const noexcept { return fd_; }
+
+    [[nodiscard]] bool is_valid() const noexcept;
+
+    [[nodiscard]] auto proc_path() const -> std::filesystem::path;
+
+    [[nodiscard]] auto current_path() const -> std::filesystem::path;
+
+    static auto cwd() -> file_descriptor_ref;
+
+    constexpr operator int() const noexcept { return fd_; }
+
+    [[nodiscard]] explicit operator bool() const noexcept { return is_valid(); }
+
+    constexpr bool operator==(file_descriptor_ref other) const noexcept { return fd_ == other.fd_; }
+
+    constexpr bool operator!=(file_descriptor_ref other) const noexcept { return fd_ != other.fd_; }
+
+    constexpr bool operator==(int raw_fd) const noexcept { return fd_ == raw_fd; }
+
+    constexpr bool operator!=(int raw_fd) const noexcept { return fd_ != raw_fd; }
+
+private:
+    explicit file_descriptor_ref(int fd) noexcept
+        : fd_(fd)
+    {
+    }
+
+    int fd_{ -1 };
+};
+
+static_assert(sizeof(file_descriptor_ref) == sizeof(int), "fd_ref must have the same size as int");
+
 class file_descriptor
 {
 public:
@@ -80,16 +123,12 @@ public:
 
     auto operator>>(std::byte &byte) -> file_descriptor &;
 
-    [[nodiscard]] auto proc_path() const -> std::filesystem::path;
-
-    [[nodiscard]] auto current_path() const -> std::filesystem::path;
-
-    static auto cwd() -> file_descriptor;
-
     [[nodiscard]] auto type() const -> std::filesystem::file_type;
 
     [[nodiscard]] auto flags() const -> unsigned int;
 
+    // TODO: move these methods to free functions later, and make them work with file_descriptor_ref
+    // as well
     auto set_flags(unsigned int flags) const & -> void;
 
     auto set_nonblock(bool nonblock) const & -> void;
@@ -151,10 +190,21 @@ public:
         return { IOStatus::Success, total_bytes };
     }
 
+    [[nodiscard]] auto ref() const noexcept -> file_descriptor_ref
+    {
+        return file_descriptor_ref{ *this };
+    }
+
 private:
-    // keep this layout, for padding optimization
     int fd_{ -1 };
-    bool auto_close_{ false };
+    bool auto_close_{
+        false
+    }; // TODO: remove this later, and use a separate class for not auto-close semantics
 };
+
+inline file_descriptor_ref::file_descriptor_ref(const file_descriptor &fd) noexcept
+    : fd_(fd.get())
+{
+}
 
 } // namespace linyaps_box::utils

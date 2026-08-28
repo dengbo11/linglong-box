@@ -5,12 +5,13 @@
 #include "linyaps_box/container_monitor.h"
 
 #include "linyaps_box/log/macro.h"
+#include "linyaps_box/os/fs.h"
 #include "linyaps_box/os/process.h"
-#include "linyaps_box/os/tty.h"
-#include "linyaps_box/utils/file.h"
+#include "linyaps_box/os/termios.h"
 #include "linyaps_box/utils/signal.h"
 #include "linyaps_box/utils/utils.h"
 
+#include <fmt/std.h>
 #include <sys/signalfd.h>
 
 #include <algorithm>
@@ -20,7 +21,7 @@ namespace {
 
 // Detect a local terminal to mirror window-resize events from.
 // Prefers stdin, then stdout; falls back to /dev/tty.
-auto detect_host_tty() -> terminal_slave
+auto detect_host_tty() -> std::optional<terminal_slave>
 {
     LINYAPS_BOX_LOG_DEBUG("detect host available tty");
 
@@ -28,25 +29,24 @@ auto detect_host_tty() -> terminal_slave
         utils::file_descriptor fd{ io, false };
         auto ret = os::isatty(fd);
         if (UNLIKELY(!ret)) {
-            throw std::system_error(ret.error().err, std::system_category(), ret.error().msg);
+            continue;
         }
 
-        if (ret.value()) {
-            return terminal_slave{ std::move(fd) };
-        }
+        return terminal_slave{ std::move(fd) };
     }
 
-    auto tty = utils::open("/dev/tty", O_RDONLY | O_CLOEXEC);
-    auto ret = os::isatty(tty);
-    if (LIKELY(ret && ret)) {
+    auto tty_res =
+      os::open("/dev/tty", { os::sys::open_flag::cloexec, os::sys::access_mode::read_only });
+    if (!tty_res) {
+        return std::nullopt;
+    }
+
+    auto tty = std::move(*tty_res);
+    if (LIKELY(os::isatty(tty))) {
         return terminal_slave{ std::move(tty) };
     }
 
-    if (!ret) {
-        throw std::system_error(ret.error().err, std::system_category(), ret.error().msg);
-    }
-
-    throw std::runtime_error("no available tty");
+    return std::nullopt;
 }
 
 // Dispatch EPOLLERR / EPOLLHUP on a forwarder's src/dst fds.
@@ -164,7 +164,7 @@ auto container_monitor::kill_child() noexcept -> int
     auto result = linyaps_box::os::waitpid(pid, status, 0);
     if (!result) {
         const auto &err = result.error();
-        LINYAPS_BOX_LOG_ERROR_ERRNO(err.err, "failed to wait container process: {}", err.msg);
+        LINYAPS_BOX_LOG_ERROR("failed to wait container process: {}", err);
         return -1;
     }
 
@@ -176,7 +176,9 @@ auto container_monitor::enable_io_forwarding(terminal_master pty,
                                              const linyaps_box::utils::file_descriptor &out) -> void
 {
     host_tty = detect_host_tty();
-    host_tty->set_raw();
+    if (host_tty) {
+        host_tty->set_raw();
+    }
 
     master = std::move(pty);
 
@@ -212,6 +214,7 @@ auto container_monitor::enable_io_forwarding(terminal_master pty,
         if (!fwd) {
             return;
         }
+
         fwd->drive();
         if (fwd->is_finished()) {
             fwd.reset();

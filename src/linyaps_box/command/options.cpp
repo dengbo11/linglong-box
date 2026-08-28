@@ -6,7 +6,6 @@
 
 #include "linyaps_box/config.h"
 #include "linyaps_box/log/macro.h"
-#include "linyaps_box/utils/file.h"
 #include "linyaps_box/utils/platform.h"
 #include "linyaps_box/version.h"
 
@@ -23,8 +22,8 @@ namespace {
 auto socket_check(const std::string &str) noexcept -> std::string
 {
     try {
-        auto ret = linyaps_box::utils::lstat(str);
-        if (!linyaps_box::utils::is_type(ret.st_mode, std::filesystem::file_type::socket)) {
+        auto ret = std::filesystem::symlink_status(str);
+        if (!std::filesystem::is_socket(ret)) {
             return "console-socket must be an existing socket file";
         }
     } catch (const std::system_error &e) {
@@ -102,6 +101,7 @@ auto register_global(CLI::App &app, linyaps_box::command::global_options &opts) 
 
     app.add_option("--log-format", opts.log_format, "Set log format: text (default) or json")
       ->type_name("FORMAT")
+      ->envname("LINYAPS_BOX_LOG_FORMAT")
       ->transform(CLI::CheckedTransformer(format_map, CLI::ignore_case))
       ->default_val(linyaps_box::log::output_format::text);
 
@@ -113,6 +113,7 @@ auto register_global(CLI::App &app, linyaps_box::command::global_options &opts) 
 
     app.add_option("--log", opts.log, std::move(help))
       ->type_name("SINK")
+      ->envname("LINYAPS_BOX_LOG_DESTINATION")
       ->check([](const std::string &s) -> std::string {
           if (s.empty()) {
               return "empty log destination";
@@ -234,12 +235,13 @@ auto register_exec(CLI::App &app, linyaps_box::command::exec_options &opts) -> C
 #ifdef LINYAPS_BOX_ENABLE_CAP
     cmd->add_option("-c,--cap", opts.caps, "Set capabilities")
       ->type_name("CAP")
-      ->transform([](const std::string &str) -> std::string {
+      ->check([](const std::string &str) {
           cap_value_t val{ };
           if (cap_from_name(str.c_str(), &val) < 0) {
               throw CLI::ValidationError("--cap", "invalid capability: " + str);
           }
-          return std::to_string(val);
+
+          return std::string{ };
       });
 #endif
     cmd->add_flag("--no-new-privs",
