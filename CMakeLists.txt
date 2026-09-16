@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.11.4) # for RHEL 8
 
 project(
   linyaps-box
-  VERSION 2.3.2
+  VERSION 2.3.4
   DESCRIPTION "A simple OCI runtime for desktop applications"
   HOMEPAGE_URL "https://github.com/OpenAtom-Linyaps/linyaps-box"
   LANGUAGES CXX)
@@ -115,6 +115,17 @@ endif()
 set(linyaps-box_CPM_LOCAL_PACKAGES_ONLY
     OFF
     CACHE BOOL "use local packages only")
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# ==============================================================================
+include(DetectArch)
+
+detect_architecture(TARGET_ARCH)
+
+message(STATUS "Detected architecture: ${TARGET_ARCH}")
+
+add_compile_definitions("LINYAPS_BOX_TARGET_ARCH_${TARGET_ARCH}")
 
 # ==============================================================================
 
@@ -282,7 +293,6 @@ function(linyaps_box_dependency name min_version repo tag)
 endfunction()
 
 if(NOT linyaps-box_OFFLINE_BUILD)
-  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
   include(CPM)
 
   if(linyaps-box_CPM_LOCAL_PACKAGES_ONLY)
